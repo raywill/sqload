@@ -11,15 +11,24 @@
 #include <memory.h>
 #include <my_global.h>
 #include <mysql.h>
+#include <vector>
 
-uint32_t g_rand = 41;
-int g_varchar_cols = 10;
-const int g_varchar_width = 1024;
-int g_thread_cnt = 0;
+uint32_t g_rand = 41; // rand seed
+int g_varchar_cols = 10; // varchar 大数据的列数
+const int g_varchar_width = 1024; // varchar 大数据每个 cell 的宽度
+int g_thread_cnt = 0; // 总线程数
 uint64_t *g_total_query = NULL;
-uint64_t *g_fail_query = NULL;
-int g_last_error_no = 0;
-int g_thread_rows = 2000000;
+uint64_t *g_fail_query = NULL; // 统计失败次数，数组，每个线程一项
+int g_last_error_no = 0; // 最后一次错误
+int g_thread_rows = 2000000; // 每个线程负责插入多少行数据
+const char *g_tb_prefix = "t_"; // 建立的表前缀
+typedef enum {
+  BALANCED_MODE = 0,
+  IMBALANCED_MODE = 1
+} RunMode;
+const RunMode g_mode = IMBALANCED_MODE; // 运行模式，0 = 均匀插入数据到所有 partition，1 = 只插入到某个 unit
+//const RunMode g_mode = BALANCED_MODE; // 运行模式，0 = 均匀插入数据到所有 partition，1 = 只插入到某个 unit
+int *g_bias_partition_id;
 
 void *freeze_runner(void *arg)
 {
@@ -89,48 +98,110 @@ void build_varchar(char *buf, int len)
   buf[len - 1] = '\0';
 }
 
-int build_create(char *create_sql, int buf_len, int cols, int thread_id)
+int gen_pk(int thread_id, std::vector<int> &pks)
+{
+  int ret = 0;
+  const int buf_len = 10240;
+  char *sql_buf = new char[buf_len];
+  int pos = 0;
+  if (g_mode == BALANCED_MODE) {
+    pos = sprintf(sql_buf,
+            "SELECT distinct partition_id FROM __all_meta_table WHERE table_id = (SELECT table_id FROM __all_table WHERE table_name = '%s%d' ORDER BY table_id DESC limit 1)",
+            g_tb_prefix, thread_id);
+  } else {
+    pos = sprintf(sql_buf,
+            "SELECT distinct partition_id FROM __all_meta_table WHERE table_id = (SELECT table_id FROM __all_table WHERE table_name = '%s%d' ORDER BY table_id DESC limit 1) AND unit_id = (SELECT unit_id FROM __all_unit WHERE unit_id > 1000 LIMIT 1)",
+            g_tb_prefix, thread_id);
+  }
+
+  char *host = getenv("MYSQL_HOST");
+  char *port = getenv("MYSQL_PORT");
+  MYSQL *conn;
+  conn = mysql_init(NULL);
+  // location aware
+  if (0 == ret) {
+    if (mysql_real_connect(conn, host, "root", "", "oceanbase", atoi(port), NULL, 0) == NULL) {
+      printf("Error-7 %u: %s\n", mysql_errno(conn), mysql_error(conn));
+    }
+  }
+  if (0 == ret) {
+    if (0 != (ret = mysql_real_query(conn, sql_buf, pos))) {
+      fprintf(stderr, "fail execute %s. ret=%d\n", sql_buf, ret);
+    } else {
+      MYSQL_RES *res;
+      MYSQL_ROW row;
+      res = mysql_use_result(conn);
+      printf("thread %d:", thread_id);
+      while ((row = mysql_fetch_row(res)) != NULL) {
+        pks.push_back(atoi(row[0]));
+        printf("%d,", atoi(row[0]));
+      }
+      printf("\n");
+      mysql_free_result(res);
+    }
+  }
+  if (NULL != conn) {
+    mysql_close(conn);
+  }
+  if (pks.size() <= 0) {
+    fprintf(stderr, "no partition id found!!!");
+  }
+  return ret;
+}
+
+int build_tablegroup(char *sql_buf, int buf_len, int tg)
+{
+  int pos = 0;
+  pos = sprintf(sql_buf, "CREATE TABLEGROUP IF NOT EXISTS tg%d", tg % 2);
+  return pos;
+}
+
+int build_create(char *sql_buf, int buf_len, int cols, int thread_id)
 {
   int pos = 0;
   int partition_count = 10;
-  pos = sprintf(create_sql, "CREATE TABLE IF NOT EXISTS mybench_t%d("
+  pos = sprintf(sql_buf, "CREATE TABLE IF NOT EXISTS %s%d("
           "primary key(pk1, pk2, pk3, pk4, pk5),"
           "pk1 int,"
           "pk2 int,"
           "pk3 int,"
           "pk4 int,"
-          "pk5 int,", thread_id);
+          "pk5 int,", g_tb_prefix, thread_id);
   for (int i = 1; i < cols; ++i) {
-    pos += sprintf(create_sql + pos, "c%d varchar(1024),", i);
+    pos += sprintf(sql_buf + pos, "c%d varchar(1024),", i);
   }
-  pos += sprintf(create_sql + pos, "c%d varchar(1024))", cols);
-  pos += sprintf(create_sql + pos, " PARTITION BY KEY(pk1) PARTITIONS %d", partition_count);
+  pos += sprintf(sql_buf + pos, "c%d varchar(1024))", cols);
+  pos += sprintf(sql_buf + pos, " TABLEGROUP = tg%d", thread_id < g_thread_cnt / 3 ? 0 : 1); // 1/3 tg0, 2/3 tg1
+  pos += sprintf(sql_buf + pos, " PARTITION BY KEY(pk1) PARTITIONS %d", partition_count);
   return pos;
 }
 
 
-int build_insert(char *buf, int buf_len, int cols, int thread_id)
+int build_insert(char *buf, int buf_len, int cols, int thread_id, std::vector<int> pks)
 {
   int scale = 100; // 用于选择 SCAN 数据范围
   int pos = 0;
   char randchar[g_varchar_width];
 
-  pos = sprintf(buf, "INSERT INTO mybench_t%d VALUES(", thread_id);
+  pos = sprintf(buf, "INSERT INTO %s%d VALUES(", g_tb_prefix, thread_id);
   int i = 0;
-  for (i = 0; i < 2; ++i) {
-    int pk = (random() % scale) * exp(- 1.0 / (double)random());
-    pos += sprintf(buf + pos, "%d,", pk);
-  }
-  for (; i < 5; ++i) {
+
+  int pk = 0;
+  pk = pks[(random() % pks.size())];
+  pos += sprintf(buf + pos, "%d,", pk); // i = 0
+  pk = (random() % scale);
+  pos += sprintf(buf + pos, "%d,", pk); // i = 1
+  for (i = 2; i < 5; ++i) {
     pos += sprintf(buf + pos, "%d,", random());
   }
 
+  int width = g_varchar_width;
   for (int i = 1; i < cols; ++i) {
-    build_varchar(randchar, g_varchar_width);
+    build_varchar(randchar, width);
     pos += sprintf(buf + pos, "'%s',", randchar);
   }
 
-  build_varchar(randchar, g_varchar_width);
+  build_varchar(randchar, width);
   pos += sprintf(buf + pos, "'%s')", randchar);
   return pos;
 }
@@ -143,8 +214,12 @@ int make_load(MYSQL *conn, int thread_id)
   // 个点打印一次执行统计，每执行 1000 个 query 打印一次执行统计。
   const int buf_len = g_varchar_cols * 1024 + 4096;
   char *sql_buf = new char[buf_len];
+  std::vector<int> pks;
+  if (0 != (ret = gen_pk(thread_id, pks))) {
+    printf("Error-8 %u: %s\n", mysql_errno(conn), mysql_error(conn));
+  }
   for (int row = 0; row < g_thread_rows; ++row) {
-    int pos = build_insert(sql_buf, buf_len, g_varchar_cols, thread_id);
+    int pos = build_insert(sql_buf, buf_len, g_varchar_cols, thread_id, pks);
     // printf("%s\n", sql_buf);
     if (0 != (ret = mysql_real_query(conn, sql_buf, pos))) {
       g_fail_query[thread_id]++;
@@ -174,11 +249,11 @@ void *task_runner(void *arg)
     mysql_thread_init();
     conn = mysql_init(NULL);
     if (conn == NULL) {
-      printf("Error %u: %s\n", mysql_errno(conn), mysql_error(conn));
+      printf("Error-1 %u: %s\n", mysql_errno(conn), mysql_error(conn));
     } else if (mysql_real_connect(conn, host, user, pass, db, atoi(port), NULL, 0) == NULL) {
-      printf("Error %u: %s\n", mysql_errno(conn), mysql_error(conn));
+      printf("Error-2 %u: %s\n", mysql_errno(conn), mysql_error(conn));
     } else if (0 != (ret = make_load(conn, thread_id))) {
-      printf("Error %u: %s\n", mysql_errno(conn), mysql_error(conn));
+      printf("Error-3 %u: %s\n", mysql_errno(conn), mysql_error(conn));
     }
     if (NULL != conn) {
       mysql_close(conn);
@@ -198,11 +273,21 @@ int create_db(MYSQL *conn, int thread_id)
   const int buf_len = g_varchar_cols * 1024 + 4096;
   char *sql_buf = new char[buf_len];
   int pos = 0;
-  pos = build_create(sql_buf, buf_len, g_varchar_cols, thread_id);
-  if (0 != (ret = mysql_real_query(conn, sql_buf, pos))) {
-    fprintf(stderr, "fail create table mybench_t%d. ret=%d\n", thread_id, ret);
-  } else {
-    printf("%s\n", sql_buf);
+  if (0 == ret) {
+    pos = build_tablegroup(sql_buf, buf_len, thread_id);
+    if (0 != (ret = mysql_real_query(conn, sql_buf, pos))) {
+      fprintf(stderr, "fail create table %s%d. ret=%d\n", g_tb_prefix, thread_id, ret);
+    } else {
+      printf("%s\n", sql_buf);
+    }
+  }
+  if (0 == ret) {
+    pos = build_create(sql_buf, buf_len, g_varchar_cols, thread_id);
+    if (0 != (ret = mysql_real_query(conn, sql_buf, pos))) {
+      fprintf(stderr, "fail create table %s%d. ret=%d\n", g_tb_prefix, thread_id, ret);
+    } else {
+      printf("%s\n", sql_buf);
+    }
   }
   return ret;
 }
@@ -223,13 +308,13 @@ int init_db()
   mysql_thread_init();
   conn = mysql_init(NULL);
   if (conn == NULL) {
-    printf("Error %u: %s\n", mysql_errno(conn), mysql_error(conn));
+    printf("Error-4 %u: %s\n", mysql_errno(conn), mysql_error(conn));
   } else if (mysql_real_connect(conn, host, user, pass, db, atoi(port), NULL, 0) == NULL) {
-    printf("Error %u: %s\n", mysql_errno(conn), mysql_error(conn));
+    printf("Error-5 %u: %s\n", mysql_errno(conn), mysql_error(conn));
   } else {
     for (thread_id = 0; thread_id < g_thread_cnt && 0 == ret; ++thread_id) {
       if (0 != (ret = create_db(conn, thread_id))) {
-        printf("Error %u: %s\n", mysql_errno(conn), mysql_error(conn));
+        printf("Error-6 %u: %s\n", mysql_errno(conn), mysql_error(conn));
       }
     }
   }
@@ -279,7 +364,9 @@ int main(int argc, char **argv)
       memset(g_total_query, 0, sizeof(uint64_t) * g_thread_cnt);
       memset(g_fail_query, 0, sizeof(uint64_t) * g_thread_cnt);
       int *id = new int[g_thread_cnt];
+
       ret = init_db();
+
       for (int i = 0; i < g_thread_cnt && 0 == ret; ++i) {
         id[i] = i;
         if (0 != (ret = pthread_create(&thread_id[i], NULL, task_runner, &id[i]))) {
