@@ -14,4 +14,4 @@ sqload 不同点在于会创建 N 张 partition 表，N 个线程独立往这些
 
 # 使用
 
-THREAD_COUNT=10 MYSQL_USER=root@obmeter MYSQL_PASS='' MYSQL_HOST=127.0.0.1 MYSQL_PORT=3306 MYSQL_DB=test ./sqload
+ > THREAD_COUNT=10 MYSQL_USER=root@obmeter MYSQL_PASS='' MYSQL_HOST=127.0.0.1 MYSQL_PORT=3306 MYSQL_DB=test ./sqload
