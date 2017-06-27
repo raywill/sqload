@@ -19,14 +19,15 @@ const int g_varchar_width = 1024; // varchar 大数据每个 cell 的宽度
 int g_thread_cnt = 0; // 总线程数
 uint64_t *g_total_query = NULL;
 uint64_t *g_fail_query = NULL; // 统计失败次数，数组，每个线程一项
+uint64_t *g_max_query = NULL; // 预计最多Query数，数组，每个线程一项
 int g_last_error_no = 0; // 最后一次错误
-int g_thread_rows = 2000000; // 每个线程负责插入多少行数据
+int g_thread_rows = 2000000; // 每个线程最多负责插入多少行数据
 const char *g_tb_prefix = "t_"; // 建立的表前缀
 typedef enum {
   BALANCED_MODE = 0,
   IMBALANCED_MODE = 1
 } RunMode;
-const RunMode g_mode = IMBALANCED_MODE; // 运行模式，0 = 均匀插入数据到所有 partition，1 = 只插入到某个 unit
+RunMode g_mode = IMBALANCED_MODE; // 运行模式，0 = 均匀插入数据到所有 partition，1 = 只插入到某个 unit
 //const RunMode g_mode = BALANCED_MODE; // 运行模式，0 = 均匀插入数据到所有 partition，1 = 只插入到某个 unit
 int *g_bias_partition_id;
 
@@ -42,23 +43,25 @@ void *freeze_runner(void *arg)
   int idle_times = 0;
 
   while (1) {
+    uint64_t cur_max_query = 0;
     uint64_t cur_total_query = 0;
     uint64_t cur_fail_query = 0;
 
     for (int i = 0; i < g_thread_cnt; ++i) {
       cur_fail_query += g_fail_query[i];
       cur_total_query += g_total_query[i];
+      cur_max_query += g_max_query[i];
     }
 
     if (cur_total_query - last_total_query > 10000) {
-      fprintf(stderr, "PROGRESS:  succ/fail/total = %ld/%ld/%ld. about %lf GB written\n",
-              cur_total_query - cur_fail_query, cur_fail_query, cur_total_query,
+      fprintf(stderr, "PROGRESS:  succ/fail/total/max = %ld/%ld/%ld/%ld. about %lf GB written\n",
+              cur_total_query - cur_fail_query, cur_fail_query, cur_total_query, cur_max_query,
               1.0 * (cur_total_query - cur_fail_query) * g_varchar_cols * g_varchar_width / 1024 / 1024 /1024);
     }
 
     if (cur_fail_query - last_fail_query > 1000) {
-      fprintf(stderr, "FAIL WARNING. succ/fail/total = %ld/%ld/%ld. last_errno=%d\n",
-              cur_total_query - cur_fail_query, cur_fail_query, cur_total_query, g_last_error_no);
+      fprintf(stderr, "FAIL WARNING. succ/fail/total/max = %ld/%ld/%ld/%ld. last_errno=%d\n",
+              cur_total_query - cur_fail_query, cur_fail_query, cur_total_query, cur_max_query, g_last_error_no);
     }
 
     if (cur_total_query - last_total_query > 10000 || cur_fail_query - last_fail_query > 1000) {
@@ -131,7 +134,7 @@ int gen_pk(int thread_id, std::vector<int> &pks)
       MYSQL_RES *res;
       MYSQL_ROW row;
       res = mysql_use_result(conn);
-      printf("thread %d:", thread_id);
+      printf("thread %d pk list:", thread_id);
       while ((row = mysql_fetch_row(res)) != NULL) {
         pks.push_back(atoi(row[0]));
         printf("%d,", atoi(row[0]));
@@ -144,22 +147,24 @@ int gen_pk(int thread_id, std::vector<int> &pks)
     mysql_close(conn);
   }
   if (pks.size() <= 0) {
-    fprintf(stderr, "no partition id found!!!");
+    fprintf(stderr, "no partition id found!!!\n");
   }
   return ret;
 }
 
-int build_tablegroup(char *sql_buf, int buf_len, int tg)
+
+// 每 2 个 table 一个 table group
+int build_tablegroup(char *sql_buf, int buf_len, int thread_id)
 {
   int pos = 0;
-  pos = sprintf(sql_buf, "CREATE TABLEGROUP IF NOT EXISTS tg%d", tg % 2);
+  pos = sprintf(sql_buf, "CREATE TABLEGROUP IF NOT EXISTS tg%d", thread_id / 2);
   return pos;
 }
 
 int build_create(char *sql_buf, int buf_len, int cols, int thread_id)
 {
   int pos = 0;
-  int partition_count = 10;
+  int partition_count = 1;
   pos = sprintf(sql_buf, "CREATE TABLE IF NOT EXISTS %s%d("
           "primary key(pk1, pk2, pk3, pk4, pk5),"
           "pk1 int,"
@@ -171,7 +176,7 @@ int build_create(char *sql_buf, int buf_len, int cols, int thread_id)
     pos += sprintf(sql_buf + pos, "c%d varchar(1024),", i);
   }
   pos += sprintf(sql_buf + pos, "c%d varchar(1024))", cols);
-  pos += sprintf(sql_buf + pos, " TABLEGROUP = tg%d", thread_id < g_thread_cnt / 3 ? 0 : 1); // 1/3 tg0, 2/3 tg1
+  pos += sprintf(sql_buf + pos, " TABLEGROUP = tg%d", thread_id / 2); // 1/3 tg0, 2/3 tg1
   pos += sprintf(sql_buf + pos, " PARTITION BY KEY(pk1) PARTITIONS %d", partition_count);
   return pos;
 }
@@ -187,7 +192,7 @@ int build_insert(char *buf, int buf_len, int cols, int thread_id, std::vector<in
   int i = 0;
 
   int pk = 0;
-  pk = pks[(random() % pks.size())];
+  pk = (pks.size() > 0) ? pks[(random() % pks.size())] : random() % scale;
   pos += sprintf(buf + pos, "%d,", pk); // i = 0
   pk = (random() % scale);
   pos += sprintf(buf + pos, "%d,", pk); // i = 1
@@ -218,14 +223,21 @@ int make_load(MYSQL *conn, int thread_id)
   if (0 != (ret = gen_pk(thread_id, pks))) {
     printf("Error-8 %u: %s\n", mysql_errno(conn), mysql_error(conn));
   }
-  for (int row = 0; row < g_thread_rows; ++row) {
-    int pos = build_insert(sql_buf, buf_len, g_varchar_cols, thread_id, pks);
-    // printf("%s\n", sql_buf);
-    if (0 != (ret = mysql_real_query(conn, sql_buf, pos))) {
-      g_fail_query[thread_id]++;
-      g_last_error_no = mysql_errno(conn);
+  if (0 == ret && pks.size() > 0) {
+    int rows = random() % g_thread_rows;
+    g_max_query[thread_id] = rows;
+    printf("thread %d will insert %d rows\n", thread_id, rows);
+    for (int row = 0; row < rows; ++row) {
+      int pos = build_insert(sql_buf, buf_len, g_varchar_cols, thread_id, pks);
+      // printf("%s\n", sql_buf);
+      if (0 != (ret = mysql_real_query(conn, sql_buf, pos))) {
+        g_fail_query[thread_id]++;
+        g_last_error_no = mysql_errno(conn);
+      }
+      g_total_query[thread_id]++;
     }
-    g_total_query[thread_id]++;
+  } else {
+    printf("INFO: no data in first unit, skip for imbalance-mode. thread_id=%d\n", thread_id);
   }
   return ret;
 }
@@ -325,6 +337,11 @@ int init_db()
   return ret;
 }
 
+void init()
+{
+  srandom(time(NULL));
+}
+
 
 int main(int argc, char **argv)
 {
@@ -346,13 +363,32 @@ int main(int argc, char **argv)
     fprintf(stderr, "invalid env param supplied\n");
   }
 
+  char *mode = getenv("MODE");
+  if (NULL != mode) {
+    if (0 == strcasecmp("imbalance", mode)) {
+      g_mode = IMBALANCED_MODE;
+      printf("g_mode:IMBALANCED_MODE\n");
+    } else {
+      g_mode = BALANCED_MODE;
+      printf("g_mode:BALANCED_MODE\n");
+    }
+  }
+
   if (NULL == thread) {
     g_thread_cnt = 1; // default
     printf("note: provide THREAD_COUNT to enable multithread test\n");
   } else {
     g_thread_cnt = atoi(thread);
-    printf("start %d thread\n", g_thread_cnt);
+    printf("g_thread_cnt:%d\n", g_thread_cnt);
   }
+
+  char *max_row_per_thread = getenv("MAX_ROW");
+  if (NULL != max_row_per_thread) {
+    g_thread_rows = atoll(max_row_per_thread);
+    printf("g_thread_rows:%ld\n", g_thread_rows);
+  }
+
+  init();
 
   if (0 == ret) {
     if (0 != (ret = mysql_library_init(0, NULL, NULL))) {
@@ -361,8 +397,10 @@ int main(int argc, char **argv)
       pthread_t *thread_id = new pthread_t[g_thread_cnt];
       g_total_query = new uint64_t[g_thread_cnt];
       g_fail_query = new uint64_t[g_thread_cnt];
+      g_max_query = new uint64_t[g_thread_cnt];
       memset(g_total_query, 0, sizeof(uint64_t) * g_thread_cnt);
       memset(g_fail_query, 0, sizeof(uint64_t) * g_thread_cnt);
+      memset(g_max_query, 0, sizeof(uint64_t) * g_thread_cnt);
       int *id = new int[g_thread_cnt];
 
       ret = init_db();
