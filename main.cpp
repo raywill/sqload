@@ -15,7 +15,7 @@
 
 uint32_t g_rand = 41; // rand seed
 int g_varchar_cols = 10; // varchar 大数据的列数
-const int g_varchar_width = 1024; // varchar 大数据每个 cell 的宽度
+const int g_varchar_width = 10240; // varchar 大数据每个 cell 的宽度
 int g_thread_cnt = 0; // 总线程数
 uint64_t *g_total_query = NULL;
 uint64_t *g_fail_query = NULL; // 统计失败次数，数组，每个线程一项
@@ -109,11 +109,11 @@ int gen_pk(int thread_id, std::vector<int> &pks)
   int pos = 0;
   if (g_mode == BALANCED_MODE) {
     pos = sprintf(sql_buf,
-            "SELECT distinct partition_id FROM __all_meta_table WHERE table_id = (SELECT table_id FROM __all_table WHERE table_name = '%s%d' ORDER BY table_id DESC limit 1)",
+            "SELECT /*+ READ_CONSISTENCY(WEAK) */ distinct partition_id FROM __all_meta_table WHERE table_id = (SELECT table_id FROM __all_table WHERE table_name = '%s%d' ORDER BY table_id DESC limit 1)",
             g_tb_prefix, thread_id);
   } else {
     pos = sprintf(sql_buf,
-            "SELECT distinct partition_id FROM __all_meta_table WHERE table_id = (SELECT table_id FROM __all_table WHERE table_name = '%s%d' ORDER BY table_id DESC limit 1) AND unit_id = (SELECT unit_id FROM __all_unit WHERE unit_id > 1000 LIMIT 1)",
+            "SELECT /*+ READ_CONSISTENCY(WEAK) */ distinct partition_id FROM __all_meta_table WHERE table_id = (SELECT table_id FROM __all_table WHERE table_name = '%s%d' ORDER BY table_id DESC limit 1) AND unit_id = (SELECT unit_id FROM __all_unit WHERE unit_id > 1000 LIMIT 1)",
             g_tb_prefix, thread_id);
   }
 
@@ -134,12 +134,18 @@ int gen_pk(int thread_id, std::vector<int> &pks)
       MYSQL_RES *res;
       MYSQL_ROW row;
       res = mysql_use_result(conn);
+#ifdef PRINT_DETAIL
       printf("thread %d pk list:", thread_id);
+#endif
       while ((row = mysql_fetch_row(res)) != NULL) {
         pks.push_back(atoi(row[0]));
+#ifdef PRINT_DETAIL
         printf("%d,", atoi(row[0]));
+#endif
       }
+#ifdef PRINT_DETAIL
       printf("\n");
+#endif
       mysql_free_result(res);
     }
   }
@@ -147,7 +153,12 @@ int gen_pk(int thread_id, std::vector<int> &pks)
     mysql_close(conn);
   }
   if (pks.size() <= 0) {
+#ifdef PRINT_DETAIL
     fprintf(stderr, "no partition id found!!!\n");
+#endif
+  }
+  if (sql_buf) {
+    delete sql_buf;
   }
   return ret;
 }
@@ -157,11 +168,11 @@ int gen_pk(int thread_id, std::vector<int> &pks)
 int build_tablegroup(char *sql_buf, int buf_len, int thread_id)
 {
   int pos = 0;
-  pos = sprintf(sql_buf, "CREATE TABLEGROUP IF NOT EXISTS tg%d", thread_id / 2);
+  pos = sprintf(sql_buf, "CREATE TABLEGROUP IF NOT EXISTS sqload_tg%d", thread_id / 2);
   return pos;
 }
 
-int build_create(char *sql_buf, int buf_len, int cols, int thread_id)
+int build_create_table(char *sql_buf, int buf_len, int cols, int thread_id)
 {
   int pos = 0;
   int partition_count = 1;
@@ -173,10 +184,10 @@ int build_create(char *sql_buf, int buf_len, int cols, int thread_id)
           "pk4 int,"
           "pk5 int,", g_tb_prefix, thread_id);
   for (int i = 1; i < cols; ++i) {
-    pos += sprintf(sql_buf + pos, "c%d varchar(1024),", i);
+    pos += sprintf(sql_buf + pos, "c%d varchar(%d),", i, g_varchar_width);
   }
-  pos += sprintf(sql_buf + pos, "c%d varchar(1024))", cols);
-  pos += sprintf(sql_buf + pos, " TABLEGROUP = tg%d", thread_id / 2); // 1/3 tg0, 2/3 tg1
+  pos += sprintf(sql_buf + pos, "c%d varchar(%d))", cols, g_varchar_width);
+  pos += sprintf(sql_buf + pos, " TABLEGROUP = sqload_tg%d", thread_id / 2); // 1/3 tg0, 2/3 tg1
   pos += sprintf(sql_buf + pos, " PARTITION BY KEY(pk1) PARTITIONS %d", partition_count);
   return pos;
 }
@@ -217,7 +228,7 @@ int make_load(MYSQL *conn, int thread_id)
   // LOAD 特点：
   // 写入大批量数据，定时自动做 major freeze，统计执行失败次数，失败次数每上升 1
   // 个点打印一次执行统计，每执行 1000 个 query 打印一次执行统计。
-  const int buf_len = g_varchar_cols * 1024 + 4096;
+  const int buf_len = g_varchar_cols * g_varchar_width + 4096;
   char *sql_buf = new char[buf_len];
   std::vector<int> pks;
   if (0 != (ret = gen_pk(thread_id, pks))) {
@@ -239,6 +250,9 @@ int make_load(MYSQL *conn, int thread_id)
   } else {
     printf("INFO: no data in first unit, skip for imbalance-mode. thread_id=%d\n", thread_id);
   }
+  if (sql_buf) {
+    delete sql_buf;
+  }
   return ret;
 }
 
@@ -254,7 +268,9 @@ void *task_runner(void *arg)
   char *port = getenv("MYSQL_PORT");
   char *db   = getenv("MYSQL_DB");
 
+#ifdef PRINT_DETAIL
   printf("task %d running\n", thread_id);
+#endif
 
   if (0 == ret) {
     MYSQL *conn;
@@ -290,16 +306,23 @@ int create_db(MYSQL *conn, int thread_id)
     if (0 != (ret = mysql_real_query(conn, sql_buf, pos))) {
       fprintf(stderr, "fail create table %s%d. ret=%d\n", g_tb_prefix, thread_id, ret);
     } else {
+#ifdef PRINT_DETAIL
       printf("%s\n", sql_buf);
+#endif
     }
   }
   if (0 == ret) {
-    pos = build_create(sql_buf, buf_len, g_varchar_cols, thread_id);
+    pos = build_create_table(sql_buf, buf_len, g_varchar_cols, thread_id);
     if (0 != (ret = mysql_real_query(conn, sql_buf, pos))) {
       fprintf(stderr, "fail create table %s%d. ret=%d\n", g_tb_prefix, thread_id, ret);
     } else {
+#ifdef PRINT_DETAIL
       printf("%s\n", sql_buf);
+#endif
     }
+  }
+  if (sql_buf) {
+    delete sql_buf;
   }
   return ret;
 }
