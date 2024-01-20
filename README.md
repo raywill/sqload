@@ -16,6 +16,9 @@ make
 ./generate_csv 10000000 "bigint,int(11),varchar(50),double,date,bigint(20)"
 ```
 
+- 第一个参数为生成的 csv 文件的记录行数；
+- 第二个参数为 csv 每一列的类型，支持几乎所有 MySQL 的类型，以及部分 Oracle 的类型。
+
 # Output Example
 ```
 raywill@raywilllocal csv % ./generate_csv 10 "key,bigint,int(11),varchar(50),double,date,bigint(20)"
