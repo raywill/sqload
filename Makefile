@@ -1,5 +1,4 @@
 all:
-	g++ main.cpp -lpthread -lmysqlclient -L ~/mysql-server/build/libmysql/ -I ~/mysql-server/include/ -o sqload
-
-test:
-	THREAD_COUNT=10 MYSQL_USER=root MYSQL_PASS='' MYSQL_HOST=localhost MYSQL_PORT=3306 MYSQL_DB=test ./sqload
+	g++ -O2 -std=c++11 generate_csv.cpp -o generate_csv
+clean:
+	rm -f generate_csv
